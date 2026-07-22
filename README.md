@@ -8,7 +8,7 @@ Export Cloudflare metrics to Prometheus. Built on Cloudflare Workers with Durabl
 
 ## Features
 
-- **90+ Prometheus metrics** - requests, bandwidth, threats, workers, load balancers, SSL certs, hostname-level analytics, network analytics, Magic Transit tunnel health/traffic/SLO, Magic Firewall per-rule visibility, stream video/live, and more
+- **90+ Prometheus metrics** - requests, bandwidth, threats, workers, Workers KV operations, load balancers, SSL certs, hostname-level analytics, network analytics, Magic Transit tunnel health/traffic/SLO, Magic Firewall per-rule visibility, stream video/live, and more
 - **Cloudflare Workers** - serverless edge deployment
 - **Durable Objects** - stateful counter accumulation for proper Prometheus semantics
 - **Background refresh** - alarms fetch data every 60s; scrapes return cached data instantly
@@ -416,6 +416,29 @@ Traffic volume metrics across Cloudflare's Network Analytics v2 datasets. All ar
 | `cloudflare_stream_live_input_gop_duration_seconds` | gauge | account, event_code |
 | `cloudflare_stream_live_input_upload_duration_ratio` | gauge | account, event_code |
 
+### Workers KV Metrics
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `cloudflare_worker_kv_operations_total` | counter | account, namespace_id, action_type |
+| `cloudflare_worker_kv_last_success_timestamp_seconds` | gauge | account |
+
+`action_type` is one of `read`, `write`, `delete`, or `list`. Values are Cloudflare **analytics estimates**, not exact operation counts.
+
+Operations are attributed to the KV namespace only — there is no KV key or Worker script attribution. Counts are accumulated from non-overlapping delayed windows (`SCRAPE_DELAY_SECONDS`, default 300s, over `TIME_WINDOW_SECONDS`, default 60s), so a spike surfaces roughly 5-10 minutes after it happens.
+
+`cloudflare_worker_kv_last_success_timestamp_seconds` only advances after a complete successful query. It holds its previous value when Cloudflare returns an error, so stale data is detectable:
+
+```promql
+# Read operations per namespace over the last hour
+sum by (namespace_id) (increase(cloudflare_worker_kv_operations_total{action_type="read"}[1h]))
+
+# Alert when KV collection goes stale
+time() - cloudflare_worker_kv_last_success_timestamp_seconds > 900
+```
+
+Requires the `Account > Account Analytics` read permission listed in [Creating an API Token](#creating-an-api-token).
+
 ### Hostname Metrics
 
 Requires `HOST_METRICS_ALLOWLIST` to be set (max 50 hostnames). Disabled when `EXCLUDE_HOST=true`.
@@ -528,15 +551,15 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │   ▼            ▼      ▼            ▼      ▼            ▼                       │
 │ ┌─────┐    ┌─────┐  ┌─────┐    ┌─────┐  ┌─────┐    ┌─────┐                     │
 │ │Exprt│    │Exprt│  │Exprt│    │Exprt│  │Exprt│    │Exprt│                     │
-│ │(21) │ .. │(N)  │  │(21) │ .. │(N)  │  │(21) │ .. │(N)  │                     │
+│ │(23) │ .. │(N)  │  │(23) │ .. │(N)  │  │(23) │ .. │(N)  │                     │
 │ │acct │    │zone │  │acct │    │zone │  │acct │    │zone │                     │
 │ └─────┘    └─────┘  └─────┘    └─────┘  └─────┘    └─────┘                     │
 │                                                                                │
 │  MetricExporter DOs (per account):                                             │
-│  - Account-scoped (21): worker-totals, logpush-account, magic-transit,         │
+│  - Account-scoped (23): worker-totals, logpush-account, magic-transit,         │
 │    magic-transit-slo, magic-transit-traffic, magic-firewall-samples,           │
-│    network-analytics, stream-video-playback, stream-live-inputs,              │
-│    http-metrics, adaptive-metrics, edge-country-metrics,                      │
+│    network-analytics, stream-video-playback, stream-live-inputs, images,       │
+│    workers-kv-operations, http-metrics, adaptive-metrics, edge-country-metrics,│
 │    colo-metrics, colo-error-metrics, request-method-metrics,                   │
 │    health-check-metrics, load-balancer-metrics, logpush-zone,                  │
 │    origin-status-metrics, cache-miss-metrics, hostname-http-metrics            │
@@ -587,7 +610,7 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
   ▼           ▼         ▼           ▼         ▼           ▼
 ┌─────┐   ┌─────┐    ┌─────┐   ┌─────┐    ┌─────┐   ┌─────┐
 │Exprt│...│Exprt│    │Exprt│...│Exprt│    │Exprt│...│Exprt│
-│21+N │   │     │    │21+N │   │     │    │21+N │   │     │
+│23+N │   │     │    │23+N │   │     │    │23+N │   │     │
 │     │   │     │    │     │   │     │    │     │   │     │
 │ ret │   │ ret │    │ ret │   │ ret │    │ ret │   │ ret │
 │cache│   │cache│    │cache│   │cache│    │cache│   │cache│
@@ -648,7 +671,7 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │                                                                        │
 │  3. Push context to MetricExporter DOs:                                │
 │     ┌────────────────────────────────────────────────────────────────┐ │
-│     │ Account-scoped (21 exporters):                                 │ │
+│     │ Account-scoped (23 exporters):                                 │ │
 │     │   exporter.updateZoneContext(accountId, accountName, zones)    │ │
 │     │                                                                │ │
 │     │ Zone-scoped (N exporters, 1 per zone):                         │ │
@@ -665,8 +688,8 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 ┌────────────────────────────────────────────────────────────────────────┐
 │           MetricExporter.refresh() for account-scoped queries          │
 │                                                                        │
-│  Query Types (21 total):                                               │
-│  ├── ACCOUNT-LEVEL (single account per query, 9):                      │
+│  Query Types (23 total):                                               │
+│  ├── ACCOUNT-LEVEL (single account per query, 11):                     │
 │  │   ├── worker-totals                                                 │
 │  │   ├── logpush-account                                               │
 │  │   ├── magic-transit                                                 │
@@ -675,7 +698,9 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │  │   ├── magic-firewall-samples                                        │
 │  │   ├── network-analytics                                             │
 │  │   ├── stream-video-playback                                         │
-│  │   └── stream-live-inputs                                            │
+│  │   ├── stream-live-inputs                                            │
+│  │   ├── images                                                        │
+│  │   └── workers-kv-operations                                         │
 │  │                                                                     │
 │  └── ZONE-LEVEL (all zones batched in one query, 12):                  │
 │      ├── http-metrics                                                  │

@@ -2,7 +2,11 @@ import { Client, type CombinedError, fetchExchange } from "@urql/core";
 import Cloudflare from "cloudflare";
 import DataLoader from "dataloader";
 import z from "zod";
-import { GraphQLError } from "../lib/errors";
+import {
+	CloudflarePrometheusError,
+	ErrorCode,
+	GraphQLError,
+} from "../lib/errors";
 import { findZoneName } from "../lib/filters";
 import {
 	configFromEnv,
@@ -43,6 +47,7 @@ import {
 	RequestMethodMetricsQuery,
 	StreamLiveInputsQuery,
 	StreamVideoPlaybackQuery,
+	WorkersKVOperationsQuery,
 	WorkerTotalsQuery,
 } from "./gql/queries";
 import type { AccountLevelQuery, ZoneLevelQuery } from "./queries";
@@ -127,6 +132,12 @@ const WORKER_METRICS = {
 	ERRORS: "cloudflare_worker_errors_total",
 	CPU_TIME: "cloudflare_worker_cpu_time_seconds",
 	DURATION: "cloudflare_worker_duration_seconds",
+} as const;
+
+// Workers KV metric names
+const KV_METRICS = {
+	OPERATIONS: "cloudflare_worker_kv_operations_total",
+	LAST_SUCCESS: "cloudflare_worker_kv_last_success_timestamp_seconds",
 } as const;
 // ### API Call Summary
 //
@@ -544,6 +555,12 @@ export class CloudflareMetricsClient {
 				);
 			case "images":
 				return this.getImagesMetrics(accountId, normalizedAccount);
+			case "workers-kv-operations":
+				return this.getWorkersKVOperationsMetrics(
+					accountId,
+					normalizedAccount,
+					timeRange,
+				);
 			default: {
 				const _exhaustive: never = query;
 				throw new Error(`Unknown account metric query: ${_exhaustive}`);
@@ -1486,6 +1503,114 @@ export class CloudflareMetricsClient {
 		}
 
 		return [countCurrent, countAllowed].filter((m) => m.values.length > 0);
+	}
+
+	/**
+	 * Fetches Workers KV operation counts per namespace and action type.
+	 *
+	 * Values are raw window deltas - the MetricExporter Durable Object accumulates
+	 * them into monotonic counters. Cloudflare reports analytics estimates, not
+	 * exact operation counts.
+	 *
+	 * @param accountId Cloudflare account ID.
+	 * @param normalizedAccount Normalized account name for labels.
+	 * @param timeRange Query time range.
+	 * @returns Workers KV operation metrics and the last-success timestamp.
+	 * @throws {CloudflarePrometheusError} When the account result is missing.
+	 */
+	private async getWorkersKVOperationsMetrics(
+		accountId: string,
+		normalizedAccount: string,
+		timeRange: { mintime: string; maxtime: string },
+	): Promise<MetricDefinition[]> {
+		const result = await this.gql.query(WorkersKVOperationsQuery, {
+			accountID: accountId,
+			mintime: timeRange.mintime,
+			maxtime: timeRange.maxtime,
+			limit: this.config.queryLimit,
+		});
+
+		if (result.error) {
+			throw graphQLQueryError("workers-kv-operations", result.error);
+		}
+
+		// A successful query always returns the account node, even with no
+		// operations in the window. A missing node means the token cannot see the
+		// account - reporting that as zero traffic would hide a runaway namespace.
+		const accounts = result.data?.viewer?.accounts ?? [];
+		if (accounts.length !== 1) {
+			throw new CloudflarePrometheusError(
+				`Workers KV query returned ${accounts.length} account results, expected 1`,
+				ErrorCode.GRAPHQL_ERROR,
+				{ context: { query: "workers-kv-operations", account_id: accountId } },
+			);
+		}
+
+		const groups = accounts[0]?.kvOperationsAdaptiveGroups ?? [];
+		const operations: MetricDefinition = {
+			name: KV_METRICS.OPERATIONS,
+			help: "Total number of Workers KV operations (Cloudflare analytics estimate)",
+			type: "counter",
+			values: [],
+		};
+
+		for (const group of groups) {
+			const requests = group.sum?.requests;
+			if (requests == null) continue;
+			const actionType = group.dimensions?.actionType;
+
+			operations.values.push({
+				labels: {
+					account: normalizedAccount,
+					namespace_id: group.dimensions?.namespaceId ?? "unknown",
+					action_type:
+						actionType === "read" ||
+						actionType === "write" ||
+						actionType === "delete" ||
+						actionType === "list"
+							? actionType
+							: "unknown",
+				},
+				value: requests,
+			});
+		}
+
+		// Hitting the limit means the window may be truncated. Failing the refresh
+		// preserves the prior complete counter snapshot and health gauge.
+		if (groups.length >= this.config.queryLimit) {
+			this.logger.warn("Workers KV operations may be truncated", {
+				account_id: accountId,
+				returned: groups.length,
+				limit: this.config.queryLimit,
+			});
+			throw new CloudflarePrometheusError(
+				"Workers KV query reached the configured limit; results may be incomplete",
+				ErrorCode.GRAPHQL_ERROR,
+				{
+					context: {
+						query: "workers-kv-operations",
+						account_id: accountId,
+						returned: groups.length,
+						limit: this.config.queryLimit,
+					},
+					retryable: true,
+				},
+			);
+		}
+
+		const lastSuccess: MetricDefinition = {
+			name: KV_METRICS.LAST_SUCCESS,
+			help: "Unix timestamp of the last successful Workers KV analytics query",
+			type: "gauge",
+			values: [
+				{
+					labels: { account: normalizedAccount },
+					value: Math.floor(Date.now() / 1000),
+				},
+			],
+		};
+
+		return [operations, lastSuccess];
 	}
 
 	/**

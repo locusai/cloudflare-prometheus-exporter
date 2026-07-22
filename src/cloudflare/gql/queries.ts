@@ -411,6 +411,32 @@ export const WorkerTotalsQuery = graphql(`
 // Note: Cloudflare's accounts filter only supports single accountTag, not accountTag_in
 // Use WorkerTotalsQuery for individual account queries
 
+export const WorkersKVOperationsQuery = graphql(`
+  query WorkersKVOperations(
+    $accountID: string!
+    $mintime: Time!
+    $maxtime: Time!
+    $limit: uint64!
+  ) {
+    viewer {
+      accounts(filter: { accountTag: $accountID }) {
+        kvOperationsAdaptiveGroups(
+          limit: $limit
+          filter: { datetime_geq: $mintime, datetime_lt: $maxtime }
+        ) {
+          dimensions {
+            namespaceId
+            actionType
+          }
+          sum {
+            requests
+          }
+        }
+      }
+    }
+  }
+`);
+
 export const LoadBalancerMetricsQuery = graphql(`
   query LoadBalancerMetrics(
     $zoneIDs: [string!]
