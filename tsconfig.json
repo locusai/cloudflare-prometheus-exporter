@@ -38,8 +38,8 @@
 		"plugins": [
 			{
 				"name": "gql.tada/ts-plugin",
-				"schema": "./src/gql/schema.gql",
-				"tadaOutputLocation": "./src/gql/graphql-env.d.ts"
+				"schema": "./src/cloudflare/gql/schema.gql",
+				"tadaOutputLocation": "./src/cloudflare/gql/graphql-env.d.ts"
 			}
 		]
 	}

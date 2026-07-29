@@ -8,7 +8,7 @@ Export Cloudflare metrics to Prometheus. Built on Cloudflare Workers with Durabl
 
 ## Features
 
-- **90+ Prometheus metrics** - requests, bandwidth, threats, workers, Workers KV operations, load balancers, SSL certs, hostname-level analytics, network analytics, Magic Transit tunnel health/traffic/SLO, Magic Firewall per-rule visibility, stream video/live, and more
+- **100+ Prometheus metrics** - requests, bandwidth, threats, workers, Workers KV operations, Durable Objects invocations/resource usage, load balancers, SSL certs, hostname-level analytics, network analytics, Magic Transit tunnel health/traffic/SLO, Magic Firewall per-rule visibility, stream video/live, and more
 - **Cloudflare Workers** - serverless edge deployment
 - **Durable Objects** - stateful counter accumulation for proper Prometheus semantics
 - **Background refresh** - alarms fetch data every 60s; scrapes return cached data instantly
@@ -439,6 +439,56 @@ time() - cloudflare_worker_kv_last_success_timestamp_seconds > 900
 
 Requires the `Account > Account Analytics` read permission listed in [Creating an API Token](#creating-an-api-token).
 
+### Durable Objects Metrics
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `cloudflare_durable_object_requests_total` | counter | account, namespace_id, script_name, status |
+| `cloudflare_durable_object_errors_total` | counter | account, namespace_id, script_name, status |
+| `cloudflare_durable_object_cpu_time_seconds_total` | counter | account, namespace_id |
+| `cloudflare_durable_object_duration_gb_seconds_total` | counter | account, namespace_id |
+| `cloudflare_durable_object_rows_read_total` | counter | account, namespace_id |
+| `cloudflare_durable_object_rows_written_total` | counter | account, namespace_id |
+| `cloudflare_durable_object_exceeded_cpu_errors_total` | counter | account, namespace_id |
+| `cloudflare_durable_object_exceeded_memory_errors_total` | counter | account, namespace_id |
+| `cloudflare_durable_object_active_websocket_connections` | gauge | account, namespace_id |
+| `cloudflare_durable_object_sqlite_stored_bytes` | gauge | account, namespace_id |
+| `cloudflare_durable_object_last_success_timestamp_seconds` | gauge | account |
+
+Values are Cloudflare **analytics estimates**, not exact counts. `script_name` and
+`status` are only available on the invocation-level metrics (`requests`/`errors`) -
+the resource-usage metrics (`cpu_time`, `duration`, `rows_read`, `rows_written`,
+`exceeded_*_errors`, `active_websocket_connections`) come from a separate
+periodic dataset that only carries `namespace_id`. Durable Object IDs are never
+exported, per the exporter's high-cardinality label policy.
+
+`cloudflare_durable_object_active_websocket_connections` and
+`cloudflare_durable_object_sqlite_stored_bytes` are **window-max snapshots**
+(the peak value Cloudflare observed within the collection window), not live
+point-in-time gauges - treat them as gauges for alerting/charting, not as
+exact concurrent state.
+
+SQLite storage snapshots are reported per-namespace on a sparse, roughly
+hourly cadence - unlike invocation and resource-usage data, which Cloudflare
+updates continuously. Querying `sqlite_stored_bytes` over the exporter's
+normal ~60s scrape window would almost never catch a reading, so it uses a
+wider 24-hour trailing lookback instead (independent of the other Durable
+Objects metrics) and reports the maximum size observed in that window.
+
+`cloudflare_durable_object_last_success_timestamp_seconds` only advances after
+a complete successful query. It holds its previous value when Cloudflare
+returns an error, so stale data is detectable:
+
+```promql
+# CPU time per namespace over the last hour
+sum by (namespace_id) (increase(cloudflare_durable_object_cpu_time_seconds_total[1h]))
+
+# Alert when Durable Objects collection goes stale
+time() - cloudflare_durable_object_last_success_timestamp_seconds > 900
+```
+
+Requires the `Account > Account Analytics` read permission listed in [Creating an API Token](#creating-an-api-token).
+
 ### Hostname Metrics
 
 Requires `HOST_METRICS_ALLOWLIST` to be set (max 50 hostnames). Disabled when `EXCLUDE_HOST=true`.
@@ -551,18 +601,19 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │   ▼            ▼      ▼            ▼      ▼            ▼                       │
 │ ┌─────┐    ┌─────┐  ┌─────┐    ┌─────┐  ┌─────┐    ┌─────┐                     │
 │ │Exprt│    │Exprt│  │Exprt│    │Exprt│  │Exprt│    │Exprt│                     │
-│ │(23) │ .. │(N)  │  │(23) │ .. │(N)  │  │(23) │ .. │(N)  │                     │
+│ │(24) │ .. │(N)  │  │(24) │ .. │(N)  │  │(24) │ .. │(N)  │                     │
 │ │acct │    │zone │  │acct │    │zone │  │acct │    │zone │                     │
 │ └─────┘    └─────┘  └─────┘    └─────┘  └─────┘    └─────┘                     │
 │                                                                                │
 │  MetricExporter DOs (per account):                                             │
-│  - Account-scoped (23): worker-totals, logpush-account, magic-transit,         │
+│  - Account-scoped (24): worker-totals, logpush-account, magic-transit,         │
 │    magic-transit-slo, magic-transit-traffic, magic-firewall-samples,           │
 │    network-analytics, stream-video-playback, stream-live-inputs, images,       │
-│    workers-kv-operations, http-metrics, adaptive-metrics, edge-country-metrics,│
-│    colo-metrics, colo-error-metrics, request-method-metrics,                   │
-│    health-check-metrics, load-balancer-metrics, logpush-zone,                  │
-│    origin-status-metrics, cache-miss-metrics, hostname-http-metrics            │
+│    workers-kv-operations, durable-objects, http-metrics, adaptive-metrics,     │
+│    edge-country-metrics, colo-metrics, colo-error-metrics,                    │
+│    request-method-metrics, health-check-metrics, load-balancer-metrics,       │
+│    logpush-zone, origin-status-metrics, cache-miss-metrics,                   │
+│    hostname-http-metrics                                                      │
 │  - Zone-scoped (N per account, 1 per zone): ssl-certificates, lb-weight-metrics │
 │                                                                                │
 │  ┌─────────────────────────────────────────────────────────────────────────┐   │
@@ -671,7 +722,7 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │                                                                        │
 │  3. Push context to MetricExporter DOs:                                │
 │     ┌────────────────────────────────────────────────────────────────┐ │
-│     │ Account-scoped (23 exporters):                                 │ │
+│     │ Account-scoped (24 exporters):                                 │ │
 │     │   exporter.updateZoneContext(accountId, accountName, zones)    │ │
 │     │                                                                │ │
 │     │ Zone-scoped (N exporters, 1 per zone):                         │ │
@@ -688,8 +739,8 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 ┌────────────────────────────────────────────────────────────────────────┐
 │           MetricExporter.refresh() for account-scoped queries          │
 │                                                                        │
-│  Query Types (23 total):                                               │
-│  ├── ACCOUNT-LEVEL (single account per query, 11):                     │
+│  Query Types (24 total):                                               │
+│  ├── ACCOUNT-LEVEL (single account per query, 12):                     │
 │  │   ├── worker-totals                                                 │
 │  │   ├── logpush-account                                               │
 │  │   ├── magic-transit                                                 │
@@ -700,7 +751,8 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │  │   ├── stream-video-playback                                         │
 │  │   ├── stream-live-inputs                                            │
 │  │   ├── images                                                        │
-│  │   └── workers-kv-operations                                         │
+│  │   ├── workers-kv-operations                                         │
+│  │   └── durable-objects                                               │
 │  │                                                                     │
 │  └── ZONE-LEVEL (all zones batched in one query, 12):                  │
 │      ├── http-metrics                                                  │
