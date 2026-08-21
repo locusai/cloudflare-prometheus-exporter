@@ -438,6 +438,108 @@ describe("workers-kv-operations", () => {
 	});
 });
 
+const WORKER_TIME_RANGE = {
+	mintime: "2026-01-01T00:00:00.000Z",
+	maxtime: "2026-01-01T00:01:00.000Z",
+};
+
+type WorkerTotalsRow = {
+	dimensions: {
+		scriptName: string;
+		status: string;
+	} | null;
+	sum: { errors: number | null; requests: number | null } | null;
+};
+
+function workerRow(
+	scriptName: string,
+	status: string,
+	requests: number,
+	errors: number,
+): WorkerTotalsRow {
+	return {
+		dimensions: { scriptName, status },
+		sum: { requests, errors },
+	};
+}
+
+function workerTotalsFetch(rows: WorkerTotalsRow[]): typeof globalThis.fetch {
+	return async () =>
+		new Response(
+			JSON.stringify({
+				data: {
+					viewer: { accounts: [{ workersInvocationsAdaptive: rows }] },
+				},
+			}),
+			{ headers: { "content-type": "application/json" } },
+		);
+}
+
+const WORKER_REQUESTS = "cloudflare_worker_requests_total";
+const WORKER_ERRORS = "cloudflare_worker_errors_total";
+const WORKER_LOADSHED = "cloudflare_worker_loadshed_total";
+
+describe("worker-totals", () => {
+	it("separates load-shed rejections from genuine script errors", async () => {
+		const client = createClient(
+			workerTotalsFetch([
+				workerRow("script-a", "success", 100, 0),
+				workerRow("script-a", "loadShed", 40, 40),
+				workerRow("script-a", "scriptThrewException", 3, 3),
+				workerRow("script-a", "clientDisconnected", 7, 0),
+			]),
+		);
+
+		const metrics = await client.getAccountMetrics(
+			"worker-totals",
+			"account-id",
+			"Account",
+			WORKER_TIME_RANGE,
+		);
+
+		const labels = { account: "account", script_name: "script-a" };
+		expect(findMetric(metrics, WORKER_REQUESTS)?.values).toEqual([
+			{ labels, value: 100 },
+			{ labels, value: 40 },
+			{ labels, value: 3 },
+			{ labels, value: 7 },
+		]);
+		expect(findMetric(metrics, WORKER_ERRORS)?.values).toEqual([
+			{ labels, value: 0 },
+			{ labels, value: 0 },
+			{ labels, value: 3 },
+			{ labels, value: 0 },
+		]);
+		expect(findMetric(metrics, WORKER_LOADSHED)?.values).toEqual([
+			{ labels, value: 0 },
+			{ labels, value: 40 },
+			{ labels, value: 0 },
+			{ labels, value: 0 },
+		]);
+	});
+
+	it("keeps both error series alive for a script whose only rows are load-shed", async () => {
+		const client = createClient(
+			workerTotalsFetch([workerRow("script-b", "loadShed", 12, 12)]),
+		);
+
+		const metrics = await client.getAccountMetrics(
+			"worker-totals",
+			"account-id",
+			"Account",
+			WORKER_TIME_RANGE,
+		);
+
+		const labels = { account: "account", script_name: "script-b" };
+		expect(findMetric(metrics, WORKER_ERRORS)?.values).toEqual([
+			{ labels, value: 0 },
+		]);
+		expect(findMetric(metrics, WORKER_LOADSHED)?.values).toEqual([
+			{ labels, value: 12 },
+		]);
+	});
+});
+
 const DO_TIME_RANGE = {
 	mintime: "2026-01-01T00:00:00.000Z",
 	maxtime: "2026-01-01T00:01:00.000Z",

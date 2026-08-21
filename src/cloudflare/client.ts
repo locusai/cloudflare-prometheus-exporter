@@ -131,6 +131,7 @@ function normalizeAccountName(name: string): string {
 const WORKER_METRICS = {
 	REQUESTS: "cloudflare_worker_requests_total",
 	ERRORS: "cloudflare_worker_errors_total",
+	LOADSHED: "cloudflare_worker_loadshed_total",
 	CPU_TIME: "cloudflare_worker_cpu_time_seconds",
 	DURATION: "cloudflare_worker_duration_seconds",
 } as const;
@@ -629,7 +630,13 @@ export class CloudflareMetricsClient {
 		};
 		const errorsMetric: MetricDefinition = {
 			name: WORKER_METRICS.ERRORS,
-			help: "Total number of worker errors",
+			help: "Total number of worker errors, excluding Cloudflare load-shed rejections",
+			type: "counter",
+			values: [],
+		};
+		const loadShedMetric: MetricDefinition = {
+			name: WORKER_METRICS.LOADSHED,
+			help: "Total number of worker invocations shed by Cloudflare",
 			type: "counter",
 			values: [],
 		};
@@ -654,13 +661,26 @@ export class CloudflareMetricsClient {
 					account: normalizedAccount,
 				};
 
+				// Emit both series with an explicit zero so neither disappears for a
+				// script whose only rows in a window are load-shed; dropping a series
+				// starts the staleness countdown in accumulateCounterMetrics and
+				// causes counter resets. Duplicate label sets across status rows are
+				// summed during serialization.
+				const status = worker.dimensions?.status;
+				const isLoadShed = status === "loadShed";
+				const errors = worker.sum?.errors ?? 0;
+
 				requestsMetric.values.push({
 					labels: baseLabels,
 					value: worker.sum?.requests ?? 0,
 				});
 				errorsMetric.values.push({
 					labels: baseLabels,
-					value: worker.sum?.errors ?? 0,
+					value: isLoadShed ? 0 : errors,
+				});
+				loadShedMetric.values.push({
+					labels: baseLabels,
+					value: isLoadShed ? errors : 0,
 				});
 
 				const quantiles = worker.quantiles;
@@ -699,6 +719,7 @@ export class CloudflareMetricsClient {
 
 		if (requestsMetric.values.length > 0) metrics.push(requestsMetric);
 		if (errorsMetric.values.length > 0) metrics.push(errorsMetric);
+		if (loadShedMetric.values.length > 0) metrics.push(loadShedMetric);
 		if (cpuTimeMetric.values.length > 0) metrics.push(cpuTimeMetric);
 		if (durationMetric.values.length > 0) metrics.push(durationMetric);
 
