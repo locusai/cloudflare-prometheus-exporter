@@ -2,7 +2,11 @@ import { Client, type CombinedError, fetchExchange } from "@urql/core";
 import Cloudflare from "cloudflare";
 import DataLoader from "dataloader";
 import z from "zod";
-import { GraphQLError } from "../lib/errors";
+import {
+	CloudflarePrometheusError,
+	ErrorCode,
+	GraphQLError,
+} from "../lib/errors";
 import { findZoneName } from "../lib/filters";
 import {
 	configFromEnv,
@@ -26,6 +30,7 @@ import {
 	CacheMissMetricsQuery,
 	ColoErrorMetricsQuery,
 	ColoMetricsQuery,
+	DurableObjectsQuery,
 	EdgeCountryMetricsQuery,
 	HealthCheckMetricsQuery,
 	HostnameHttpMetricsQuery,
@@ -43,6 +48,7 @@ import {
 	RequestMethodMetricsQuery,
 	StreamLiveInputsQuery,
 	StreamVideoPlaybackQuery,
+	WorkersKVOperationsQuery,
 	WorkerTotalsQuery,
 } from "./gql/queries";
 import type { AccountLevelQuery, ZoneLevelQuery } from "./queries";
@@ -128,6 +134,33 @@ const WORKER_METRICS = {
 	CPU_TIME: "cloudflare_worker_cpu_time_seconds",
 	DURATION: "cloudflare_worker_duration_seconds",
 } as const;
+
+// Workers KV metric names
+const KV_METRICS = {
+	OPERATIONS: "cloudflare_worker_kv_operations_total",
+	LAST_SUCCESS: "cloudflare_worker_kv_last_success_timestamp_seconds",
+} as const;
+
+// Durable Objects metric names
+const DURABLE_OBJECT_METRICS = {
+	REQUESTS: "cloudflare_durable_object_requests_total",
+	ERRORS: "cloudflare_durable_object_errors_total",
+	CPU_TIME: "cloudflare_durable_object_cpu_time_seconds_total",
+	DURATION: "cloudflare_durable_object_duration_gb_seconds_total",
+	ROWS_READ: "cloudflare_durable_object_rows_read_total",
+	ROWS_WRITTEN: "cloudflare_durable_object_rows_written_total",
+	EXCEEDED_CPU_ERRORS: "cloudflare_durable_object_exceeded_cpu_errors_total",
+	EXCEEDED_MEMORY_ERRORS:
+		"cloudflare_durable_object_exceeded_memory_errors_total",
+	ACTIVE_WEBSOCKET_CONNECTIONS:
+		"cloudflare_durable_object_active_websocket_connections",
+	SQLITE_STORED_BYTES: "cloudflare_durable_object_sqlite_stored_bytes",
+	LAST_SUCCESS: "cloudflare_durable_object_last_success_timestamp_seconds",
+} as const;
+
+// SQLite storage snapshots are reported far less often than invocations, so
+// they need a much wider lookback than the exporter's normal scrape window.
+const DURABLE_OBJECT_STORAGE_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 // ### API Call Summary
 //
 // Most zone-level request/bandwidth/threat metrics come from **a single GraphQL call** (`HTTPMetricsQuery`). Premium metrics require separate calls.
@@ -544,6 +577,18 @@ export class CloudflareMetricsClient {
 				);
 			case "images":
 				return this.getImagesMetrics(accountId, normalizedAccount);
+			case "workers-kv-operations":
+				return this.getWorkersKVOperationsMetrics(
+					accountId,
+					normalizedAccount,
+					timeRange,
+				);
+			case "durable-objects":
+				return this.getDurableObjectsMetrics(
+					accountId,
+					normalizedAccount,
+					timeRange,
+				);
 			default: {
 				const _exhaustive: never = query;
 				throw new Error(`Unknown account metric query: ${_exhaustive}`);
@@ -1486,6 +1531,365 @@ export class CloudflareMetricsClient {
 		}
 
 		return [countCurrent, countAllowed].filter((m) => m.values.length > 0);
+	}
+
+	/**
+	 * Fetches Workers KV operation counts per namespace and action type.
+	 *
+	 * Values are raw window deltas - the MetricExporter Durable Object accumulates
+	 * them into monotonic counters. Cloudflare reports analytics estimates, not
+	 * exact operation counts.
+	 *
+	 * @param accountId Cloudflare account ID.
+	 * @param normalizedAccount Normalized account name for labels.
+	 * @param timeRange Query time range.
+	 * @returns Workers KV operation metrics and the last-success timestamp.
+	 * @throws {CloudflarePrometheusError} When the account result is missing.
+	 */
+	private async getWorkersKVOperationsMetrics(
+		accountId: string,
+		normalizedAccount: string,
+		timeRange: { mintime: string; maxtime: string },
+	): Promise<MetricDefinition[]> {
+		const result = await this.gql.query(WorkersKVOperationsQuery, {
+			accountID: accountId,
+			mintime: timeRange.mintime,
+			maxtime: timeRange.maxtime,
+			limit: this.config.queryLimit,
+		});
+
+		if (result.error) {
+			throw graphQLQueryError("workers-kv-operations", result.error);
+		}
+
+		// A successful query always returns the account node, even with no
+		// operations in the window. A missing node means the token cannot see the
+		// account - reporting that as zero traffic would hide a runaway namespace.
+		const accounts = result.data?.viewer?.accounts ?? [];
+		if (accounts.length !== 1) {
+			throw new CloudflarePrometheusError(
+				`Workers KV query returned ${accounts.length} account results, expected 1`,
+				ErrorCode.GRAPHQL_ERROR,
+				{ context: { query: "workers-kv-operations", account_id: accountId } },
+			);
+		}
+
+		const groups = accounts[0]?.kvOperationsAdaptiveGroups ?? [];
+		const operations: MetricDefinition = {
+			name: KV_METRICS.OPERATIONS,
+			help: "Total number of Workers KV operations (Cloudflare analytics estimate)",
+			type: "counter",
+			values: [],
+		};
+
+		for (const group of groups) {
+			const requests = group.sum?.requests;
+			if (requests == null) continue;
+			const actionType = group.dimensions?.actionType;
+
+			operations.values.push({
+				labels: {
+					account: normalizedAccount,
+					namespace_id: group.dimensions?.namespaceId ?? "unknown",
+					action_type:
+						actionType === "read" ||
+						actionType === "write" ||
+						actionType === "delete" ||
+						actionType === "list"
+							? actionType
+							: "unknown",
+				},
+				value: requests,
+			});
+		}
+
+		// Hitting the limit means the window may be truncated. Failing the refresh
+		// preserves the prior complete counter snapshot and health gauge.
+		if (groups.length >= this.config.queryLimit) {
+			this.logger.warn("Workers KV operations may be truncated", {
+				account_id: accountId,
+				returned: groups.length,
+				limit: this.config.queryLimit,
+			});
+			throw new CloudflarePrometheusError(
+				"Workers KV query reached the configured limit; results may be incomplete",
+				ErrorCode.GRAPHQL_ERROR,
+				{
+					context: {
+						query: "workers-kv-operations",
+						account_id: accountId,
+						returned: groups.length,
+						limit: this.config.queryLimit,
+					},
+					retryable: true,
+				},
+			);
+		}
+
+		const lastSuccess: MetricDefinition = {
+			name: KV_METRICS.LAST_SUCCESS,
+			help: "Unix timestamp of the last successful Workers KV analytics query",
+			type: "gauge",
+			values: [
+				{
+					labels: { account: normalizedAccount },
+					value: Math.floor(Date.now() / 1000),
+				},
+			],
+		};
+
+		return [operations, lastSuccess];
+	}
+
+	/**
+	 * Fetches Durable Objects invocation, resource-usage, and SQLite storage
+	 * metrics for the account.
+	 *
+	 * Values are raw window deltas - the MetricExporter Durable Object accumulates
+	 * them into monotonic counters. Cloudflare reports analytics estimates, not
+	 * exact counts. `sqlite_stored_bytes` and `active_websocket_connections` are
+	 * window-max snapshots reported as gauges, not counters.
+	 *
+	 * @param accountId Cloudflare account ID.
+	 * @param normalizedAccount Normalized account name for labels.
+	 * @param timeRange Query time range.
+	 * @returns Durable Objects metrics and the last-success timestamp.
+	 * @throws {CloudflarePrometheusError} When the account result is missing.
+	 */
+	private async getDurableObjectsMetrics(
+		accountId: string,
+		normalizedAccount: string,
+		timeRange: { mintime: string; maxtime: string },
+	): Promise<MetricDefinition[]> {
+		// SQLite storage snapshots are reported per-namespace on a sparse,
+		// roughly hourly cadence - the exporter's normal ~60s scrape window
+		// almost never lands on a reading. Look back further just for that
+		// dataset so the gauge reliably reflects the latest known size.
+		const storageMintime = new Date(
+			new Date(timeRange.maxtime).getTime() -
+				DURABLE_OBJECT_STORAGE_LOOKBACK_MS,
+		).toISOString();
+
+		const result = await this.gql.query(DurableObjectsQuery, {
+			accountID: accountId,
+			mintime: timeRange.mintime,
+			maxtime: timeRange.maxtime,
+			storageMintime,
+			limit: this.config.queryLimit,
+		});
+
+		if (result.error) {
+			throw graphQLQueryError("durable-objects", result.error);
+		}
+
+		// A successful query always returns the account node, even with no
+		// activity in the window. A missing node means the token cannot see the
+		// account - reporting that as zero usage would hide a runaway namespace.
+		const accounts = result.data?.viewer?.accounts ?? [];
+		if (accounts.length !== 1) {
+			throw new CloudflarePrometheusError(
+				`Durable Objects query returned ${accounts.length} account results, expected 1`,
+				ErrorCode.GRAPHQL_ERROR,
+				{ context: { query: "durable-objects", account_id: accountId } },
+			);
+		}
+
+		const invocationGroups =
+			accounts[0]?.durableObjectsInvocationsAdaptiveGroups ?? [];
+		const periodicGroups = accounts[0]?.durableObjectsPeriodicGroups ?? [];
+		const sqlStorageGroups = accounts[0]?.durableObjectsSqlStorageGroups ?? [];
+
+		const requests: MetricDefinition = {
+			name: DURABLE_OBJECT_METRICS.REQUESTS,
+			help: "Total number of Durable Object invocations (Cloudflare analytics estimate)",
+			type: "counter",
+			values: [],
+		};
+		const errors: MetricDefinition = {
+			name: DURABLE_OBJECT_METRICS.ERRORS,
+			help: "Total number of Durable Object invocation errors (Cloudflare analytics estimate)",
+			type: "counter",
+			values: [],
+		};
+
+		for (const group of invocationGroups) {
+			const dims = group.dimensions;
+			if (dims == null) continue;
+
+			const labels = {
+				account: normalizedAccount,
+				namespace_id: dims.namespaceId ?? "unknown",
+				script_name: dims.scriptName ?? "unknown",
+				status: dims.status ?? "unknown",
+			};
+
+			if (group.sum?.requests != null) {
+				requests.values.push({ labels, value: group.sum.requests });
+			}
+			if (group.sum?.errors != null) {
+				errors.values.push({ labels, value: group.sum.errors });
+			}
+		}
+
+		const cpuTime: MetricDefinition = {
+			name: DURABLE_OBJECT_METRICS.CPU_TIME,
+			help: "Total Durable Object CPU time in seconds (Cloudflare analytics estimate)",
+			type: "counter",
+			values: [],
+		};
+		const duration: MetricDefinition = {
+			name: DURABLE_OBJECT_METRICS.DURATION,
+			help: "Total Durable Object duration in GB-seconds (Cloudflare analytics estimate)",
+			type: "counter",
+			values: [],
+		};
+		const rowsRead: MetricDefinition = {
+			name: DURABLE_OBJECT_METRICS.ROWS_READ,
+			help: "Total SQLite rows read by Durable Objects (Cloudflare analytics estimate)",
+			type: "counter",
+			values: [],
+		};
+		const rowsWritten: MetricDefinition = {
+			name: DURABLE_OBJECT_METRICS.ROWS_WRITTEN,
+			help: "Total SQLite rows written by Durable Objects (Cloudflare analytics estimate)",
+			type: "counter",
+			values: [],
+		};
+		const exceededCpuErrors: MetricDefinition = {
+			name: DURABLE_OBJECT_METRICS.EXCEEDED_CPU_ERRORS,
+			help: "Total Durable Object invocations that exceeded the CPU time limit (Cloudflare analytics estimate)",
+			type: "counter",
+			values: [],
+		};
+		const exceededMemoryErrors: MetricDefinition = {
+			name: DURABLE_OBJECT_METRICS.EXCEEDED_MEMORY_ERRORS,
+			help: "Total Durable Object invocations that exceeded the memory limit (Cloudflare analytics estimate)",
+			type: "counter",
+			values: [],
+		};
+		const activeWebsocketConnections: MetricDefinition = {
+			name: DURABLE_OBJECT_METRICS.ACTIVE_WEBSOCKET_CONNECTIONS,
+			help: "Maximum concurrent Durable Object websocket connections observed in the collection window (Cloudflare analytics estimate, not a live count)",
+			type: "gauge",
+			values: [],
+		};
+
+		for (const group of periodicGroups) {
+			const dims = group.dimensions;
+			if (dims == null) continue;
+
+			const labels = {
+				account: normalizedAccount,
+				namespace_id: dims.namespaceId ?? "unknown",
+			};
+
+			if (group.sum?.cpuTime != null) {
+				cpuTime.values.push({ labels, value: group.sum.cpuTime / 1_000_000 });
+			}
+			if (group.sum?.duration != null) {
+				duration.values.push({ labels, value: group.sum.duration });
+			}
+			if (group.sum?.rowsRead != null) {
+				rowsRead.values.push({ labels, value: group.sum.rowsRead });
+			}
+			if (group.sum?.rowsWritten != null) {
+				rowsWritten.values.push({ labels, value: group.sum.rowsWritten });
+			}
+			if (group.sum?.exceededCpuErrors != null) {
+				exceededCpuErrors.values.push({
+					labels,
+					value: group.sum.exceededCpuErrors,
+				});
+			}
+			if (group.sum?.exceededMemoryErrors != null) {
+				exceededMemoryErrors.values.push({
+					labels,
+					value: group.sum.exceededMemoryErrors,
+				});
+			}
+			if (group.max?.activeWebsocketConnections != null) {
+				activeWebsocketConnections.values.push({
+					labels,
+					value: group.max.activeWebsocketConnections,
+				});
+			}
+		}
+
+		const sqliteStoredBytes: MetricDefinition = {
+			name: DURABLE_OBJECT_METRICS.SQLITE_STORED_BYTES,
+			help: "Maximum SQLite storage bytes observed in the collection window for Durable Objects (Cloudflare analytics estimate, not a live count)",
+			type: "gauge",
+			values: [],
+		};
+
+		for (const group of sqlStorageGroups) {
+			const dims = group.dimensions;
+			if (dims == null) continue;
+			if (group.max?.storedBytes == null) continue;
+
+			sqliteStoredBytes.values.push({
+				labels: {
+					account: normalizedAccount,
+					namespace_id: dims.namespaceId ?? "unknown",
+				},
+				value: group.max.storedBytes,
+			});
+		}
+
+		// Hitting the limit on any dataset means that dataset's window may be
+		// truncated. Failing the refresh preserves the prior complete counter
+		// snapshots and health gauge, matching the Workers KV collector.
+		const truncated =
+			invocationGroups.length >= this.config.queryLimit ||
+			periodicGroups.length >= this.config.queryLimit ||
+			sqlStorageGroups.length >= this.config.queryLimit;
+		if (truncated) {
+			this.logger.warn("Durable Objects query may be truncated", {
+				account_id: accountId,
+				invocations: invocationGroups.length,
+				periodic: periodicGroups.length,
+				sql_storage: sqlStorageGroups.length,
+				limit: this.config.queryLimit,
+			});
+			throw new CloudflarePrometheusError(
+				"Durable Objects query reached the configured limit; results may be incomplete",
+				ErrorCode.GRAPHQL_ERROR,
+				{
+					context: {
+						query: "durable-objects",
+						account_id: accountId,
+						limit: this.config.queryLimit,
+					},
+					retryable: true,
+				},
+			);
+		}
+
+		const lastSuccess: MetricDefinition = {
+			name: DURABLE_OBJECT_METRICS.LAST_SUCCESS,
+			help: "Unix timestamp of the last successful Durable Objects analytics query",
+			type: "gauge",
+			values: [
+				{
+					labels: { account: normalizedAccount },
+					value: Math.floor(Date.now() / 1000),
+				},
+			],
+		};
+
+		return [
+			requests,
+			errors,
+			cpuTime,
+			duration,
+			rowsRead,
+			rowsWritten,
+			exceededCpuErrors,
+			exceededMemoryErrors,
+			activeWebsocketConnections,
+			sqliteStoredBytes,
+			lastSuccess,
+		].filter((m) => m.values.length > 0);
 	}
 
 	/**

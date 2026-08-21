@@ -217,3 +217,163 @@ describe("MetricExporter state recovery", () => {
 		await expect(exporter.export()).resolves.toEqual([]);
 	});
 });
+
+const KV_OPERATIONS = "cloudflare_worker_kv_operations_total";
+const KV_LAST_SUCCESS = "cloudflare_worker_kv_last_success_timestamp_seconds";
+
+const KV_ZONE = {
+	id: "zone-id",
+	name: "example.com",
+	status: "active",
+	plan: { id: "paid", name: "Paid" },
+	account: { id: "account-id", name: "Account" },
+};
+
+function kvResponse(requests: number): Response {
+	return new Response(
+		JSON.stringify({
+			data: {
+				viewer: {
+					accounts: [
+						{
+							kvOperationsAdaptiveGroups: [
+								{
+									dimensions: { namespaceId: "ns-a", actionType: "read" },
+									sum: { requests },
+								},
+							],
+						},
+					],
+				},
+			},
+		}),
+		{ headers: { "content-type": "application/json" } },
+	);
+}
+
+function kvExporterEnv(fetch: ReturnType<typeof vi.fn>) {
+	vi.stubGlobal("fetch", fetch);
+	vi.spyOn(console, "log").mockImplementation(() => {});
+	return {
+		CLOUDFLARE_API_TOKEN: "token",
+		CONFIG_KV: { get: vi.fn().mockResolvedValue(null) },
+		CF_API_RATE_LIMITER: {
+			limit: vi.fn().mockResolvedValue({ success: true }),
+		},
+	};
+}
+
+function kvStorage(): AlarmStorage {
+	const storage = new AlarmStorage();
+	storage.values.set("state", {
+		...storedState(),
+		queryName: "workers-kv-operations",
+		zones: [KV_ZONE],
+	});
+	return storage;
+}
+
+describe("MetricExporter Workers KV metrics", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("exports KV operations and the last-success gauge", async () => {
+		const storage = kvStorage();
+		const fetch = vi
+			.fn<typeof globalThis.fetch>()
+			.mockResolvedValue(kvResponse(1200));
+		const { exporter, ready } = createExporter(storage, kvExporterEnv(fetch));
+		await ready;
+
+		await exporter.alarm();
+
+		const metrics = await exporter.export();
+		expect(
+			metrics.find((metric) => metric.name === KV_OPERATIONS)?.values,
+		).toEqual([
+			{
+				labels: {
+					account: "account",
+					namespace_id: "ns-a",
+					action_type: "read",
+				},
+				value: 1200,
+			},
+		]);
+		expect(
+			metrics.find((metric) => metric.name === KV_LAST_SUCCESS),
+		).toBeDefined();
+	});
+
+	it("accumulates adjacent windows and ignores a replayed window", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(new Date("2026-01-01T00:10:30.000Z"));
+		const storage = kvStorage();
+		const fetch = vi
+			.fn<typeof globalThis.fetch>()
+			.mockImplementation(async () => kvResponse(100));
+		const { exporter, ready } = createExporter(storage, kvExporterEnv(fetch));
+		await ready;
+
+		await exporter.alarm();
+		// Same minute - same time range, so the window replays and must not count twice.
+		await exporter.alarm();
+		vi.setSystemTime(new Date("2026-01-01T00:11:30.000Z"));
+		await exporter.alarm();
+
+		const metrics = await exporter.export();
+		expect(
+			metrics.find((metric) => metric.name === KV_OPERATIONS)?.values[0]?.value,
+		).toBe(200);
+	});
+
+	it("retains cached metrics and the last-success gauge when a refresh fails", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(new Date("2026-01-01T00:10:30.000Z"));
+		const storage = kvStorage();
+		const fetch = vi
+			.fn<typeof globalThis.fetch>()
+			.mockResolvedValueOnce(kvResponse(100))
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({ errors: [{ message: "internal server error" }] }),
+					{ headers: { "content-type": "application/json" } },
+				),
+			)
+			.mockResolvedValueOnce(kvResponse(50));
+		const { exporter, ready } = createExporter(storage, kvExporterEnv(fetch));
+		await ready;
+
+		await exporter.alarm();
+		const firstTimestamp = (await exporter.export()).find(
+			(metric) => metric.name === KV_LAST_SUCCESS,
+		)?.values[0]?.value;
+
+		vi.setSystemTime(new Date("2026-01-01T00:11:30.000Z"));
+		await exporter.alarm();
+
+		const metrics = await exporter.export();
+		expect(
+			metrics.find((metric) => metric.name === KV_OPERATIONS)?.values[0]?.value,
+		).toBe(100);
+		expect(
+			metrics.find((metric) => metric.name === KV_LAST_SUCCESS)?.values[0]
+				?.value,
+		).toBe(firstTimestamp);
+
+		vi.setSystemTime(new Date("2026-01-01T00:12:30.000Z"));
+		await exporter.alarm();
+
+		const recoveredMetrics = await exporter.export();
+		expect(
+			recoveredMetrics.find((metric) => metric.name === KV_OPERATIONS)
+				?.values[0]?.value,
+		).toBe(150);
+		expect(
+			recoveredMetrics.find((metric) => metric.name === KV_LAST_SUCCESS)
+				?.values[0]?.value,
+		).toBeGreaterThan(firstTimestamp ?? 0);
+		expect(storage.setAlarm).toHaveBeenCalledTimes(3);
+	});
+});

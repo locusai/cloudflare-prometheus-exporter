@@ -411,6 +411,95 @@ export const WorkerTotalsQuery = graphql(`
 // Note: Cloudflare's accounts filter only supports single accountTag, not accountTag_in
 // Use WorkerTotalsQuery for individual account queries
 
+export const WorkersKVOperationsQuery = graphql(`
+  query WorkersKVOperations(
+    $accountID: string!
+    $mintime: Time!
+    $maxtime: Time!
+    $limit: uint64!
+  ) {
+    viewer {
+      accounts(filter: { accountTag: $accountID }) {
+        kvOperationsAdaptiveGroups(
+          limit: $limit
+          filter: { datetime_geq: $mintime, datetime_lt: $maxtime }
+        ) {
+          dimensions {
+            namespaceId
+            actionType
+          }
+          sum {
+            requests
+          }
+        }
+      }
+    }
+  }
+`);
+
+export const DurableObjectsQuery = graphql(`
+  query DurableObjects(
+    $accountID: string!
+    $mintime: Time!
+    $maxtime: Time!
+    $storageMintime: Time!
+    $limit: uint64!
+  ) {
+    viewer {
+      accounts(filter: { accountTag: $accountID }) {
+        durableObjectsInvocationsAdaptiveGroups(
+          limit: $limit
+          filter: { datetime_geq: $mintime, datetime_lt: $maxtime }
+        ) {
+          dimensions {
+            namespaceId
+            scriptName
+            status
+          }
+          sum {
+            errors
+            requests
+          }
+        }
+        durableObjectsPeriodicGroups(
+          limit: $limit
+          filter: { datetimeMinute_geq: $mintime, datetimeMinute_lt: $maxtime }
+        ) {
+          dimensions {
+            namespaceId
+          }
+          sum {
+            cpuTime
+            duration
+            exceededCpuErrors
+            exceededMemoryErrors
+            rowsRead
+            rowsWritten
+          }
+          max {
+            activeWebsocketConnections
+          }
+        }
+        # Storage snapshots are reported per-namespace on a sparse, roughly
+        # hourly cadence (not per-minute like invocations/periodic usage), so
+        # this uses a wider trailing window (storageMintime) to reliably catch
+        # the latest reading instead of the exporter's normal ~60s scrape window.
+        durableObjectsSqlStorageGroups(
+          limit: $limit
+          filter: { datetimeHour_geq: $storageMintime, datetimeHour_lt: $maxtime }
+        ) {
+          dimensions {
+            namespaceId
+          }
+          max {
+            storedBytes
+          }
+        }
+      }
+    }
+  }
+`);
+
 export const LoadBalancerMetricsQuery = graphql(`
   query LoadBalancerMetrics(
     $zoneIDs: [string!]
