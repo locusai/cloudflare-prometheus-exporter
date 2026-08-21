@@ -265,8 +265,14 @@ curl -X DELETE https://your-worker.workers.dev/config
 |--------|------|--------|
 | `cloudflare_worker_requests_total` | counter | script_name |
 | `cloudflare_worker_errors_total` | counter | script_name |
+| `cloudflare_worker_loadshed_total` | counter | script_name |
 | `cloudflare_worker_cpu_time_seconds` | gauge | script_name, quantile |
 | `cloudflare_worker_duration_seconds` | gauge | script_name, quantile |
+
+`cloudflare_worker_errors_total` counts genuine script errors
+(`scriptThrewException`, `exceededCpu`, ...). Cloudflare load-shed rejections
+are reported separately as `cloudflare_worker_loadshed_total` and are excluded
+from the error count.
 
 ### Load Balancer Metrics
 
