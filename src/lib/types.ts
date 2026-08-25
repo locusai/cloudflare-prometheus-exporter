@@ -58,6 +58,12 @@ export const CounterStateSchema = z
 		lastIngest: z.number().int().nonnegative().optional(),
 		/** Zone label used to isolate expiry during partial query failures. */
 		scope: z.string().optional(),
+		/**
+		 * Labels this series was last observed with, so a retained counter can
+		 * keep being exported while Cloudflare reports no rows for it. Optional
+		 * so state written by earlier exporter versions can be migrated.
+		 */
+		labels: z.record(z.string(), z.string()).optional(),
 	})
 	.readonly();
 

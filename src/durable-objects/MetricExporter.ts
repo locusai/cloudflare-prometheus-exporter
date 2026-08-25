@@ -12,7 +12,10 @@ import {
 	loadChunkedValue,
 	saveChunkedValue,
 } from "../lib/chunked-storage";
-import { accumulateCounterMetrics } from "../lib/counters";
+import {
+	accumulateCounterMetrics,
+	staleCounterMissesFor,
+} from "../lib/counters";
 import { parseCommaSeparated, partitionZonesByTier } from "../lib/filters";
 import { configFromEnv, createLogger, type Logger } from "../lib/logger";
 import { getMetricRefreshDelaySeconds } from "../lib/metric-refresh";
@@ -408,6 +411,9 @@ export class MetricExporter extends DurableObject<Env> {
 					ingestId,
 					ageMissingCounters: state.lastIngest !== ingestId,
 					failedScopes: result.failedScopes,
+					staleCounterMisses: staleCounterMissesFor(
+						config.metricRefreshIntervalSeconds,
+					),
 				},
 			);
 			const currentState = this.getState();
