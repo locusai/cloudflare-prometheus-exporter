@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { accumulateCounterMetrics } from "./counters";
+import {
+	accumulateCounterMetrics,
+	staleCounterMissesFor,
+} from "./counters";
 import type { MetricDefinition } from "./metrics";
 
 describe("accumulateCounterMetrics", () => {
@@ -223,5 +226,72 @@ describe("accumulateCounterMetrics", () => {
 		}
 
 		expect(Object.keys(counters)).toHaveLength(50);
+	});
+
+	it("keeps exporting a retained counter when the window reports no rows", () => {
+		const observed: MetricDefinition = {
+			name: "cloudflare_durable_object_requests_total",
+			help: "Total requests",
+			type: "counter",
+			values: [{ labels: { namespace_id: "ns", status: "success" }, value: 2 }],
+		};
+		const empty: MetricDefinition = { ...observed, values: [] };
+
+		let result = accumulateCounterMetrics([observed], {});
+		expect(result.metrics[0]?.values).toEqual([
+			{ labels: { namespace_id: "ns", status: "success" }, value: 2 },
+		]);
+
+		// Cloudflare returns no row for this tuple, but the series must stay in
+		// the scrape or increase() sees a staleness gap it cannot bridge.
+		result = accumulateCounterMetrics([empty], result.counters);
+		expect(result.metrics[0]?.values).toEqual([
+			{ labels: { namespace_id: "ns", status: "success" }, value: 2 },
+		]);
+	});
+
+	it("keeps a quiet series monotonic across a long silence", () => {
+		const metric: MetricDefinition = {
+			name: "cloudflare_durable_object_requests_total",
+			help: "Total requests",
+			type: "counter",
+			values: [{ labels: { namespace_id: "quiet" }, value: 2 }],
+		};
+		const empty: MetricDefinition = { ...metric, values: [] };
+		const options = { staleCounterMisses: staleCounterMissesFor(60) };
+
+		let result = accumulateCounterMetrics([metric], {}, options);
+		// Forty minutes of silence, the real gap between requests on a quiet
+		// Durable Object namespace. Under the old five-refresh budget the state
+		// was discarded and the counter restarted from zero.
+		for (let refresh = 0; refresh < 40; refresh++) {
+			result = accumulateCounterMetrics([empty], result.counters, options);
+		}
+		expect(result.metrics[0]?.values[0]?.value).toBe(2);
+
+		result = accumulateCounterMetrics([metric], result.counters, options);
+		expect(result.metrics[0]?.values[0]?.value).toBe(4);
+	});
+
+	it("does not re-export a counter stored before labels were tracked", () => {
+		const empty: MetricDefinition = {
+			name: "cloudflare_requests_total",
+			help: "Total requests",
+			type: "counter",
+			values: [],
+		};
+		const legacy = {
+			"cloudflare_requests_total{zone=example.com}": { accumulated: 42 },
+		};
+
+		const result = accumulateCounterMetrics([empty], legacy);
+		expect(result.metrics[0]?.values).toEqual([]);
+	});
+
+	it("sizes the miss budget to outlast a 24h recording-rule window", () => {
+		expect(staleCounterMissesFor(60)).toBe(1500);
+		expect(staleCounterMissesFor(300)).toBe(300);
+		expect(staleCounterMissesFor(0)).toBe(5);
+		expect(staleCounterMissesFor(Number.NaN)).toBe(5);
 	});
 });
